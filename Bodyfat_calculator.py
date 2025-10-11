@@ -6,7 +6,7 @@ import torch, torch.nn as nn
 from torchvision import models, transforms
 
 # ======== CONFIG ========
-MODEL_PATH = "artifacts/gender_resnet18.pt"   # พาธโมเดลเพศ (.pt)
+MODEL_PATH = "artifacts/gender_classification.pt"   # พาธโมเดลเพศ (.pt)
 CAM_INDEX  = 0
 STILL_FRAMES = 18           # ต้องนิ่งติดต่อกันกี่เฟรมจึงแคป
 MOTION_THRESH = 2.0         # ค่าความต่างเฉลี่ย (0-255) ที่ถือว่านิ่ง (ยิ่งเล็กยิ่งเข้มงวด)
