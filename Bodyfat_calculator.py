@@ -8,9 +8,12 @@ from torchvision import models, transforms
 # ======== CONFIG ========
 MODEL_PATH = "artifacts/gender_classification.pt"   # พาธโมเดลเพศ (.pt)
 CAM_INDEX  = 0
-STILL_FRAMES = 18           # ต้องนิ่งติดต่อกันกี่เฟรมจึงแคป
-MOTION_THRESH = 2.0         # ค่าความต่างเฉลี่ย (0-255) ที่ถือว่านิ่ง (ยิ่งเล็กยิ่งเข้มงวด)
-SIDE_SCALE = 0.88           # ประมาณความกว้างด้านข้างจากภาพหน้าตรง (0.85-0.9 แนะนำ)
+STILL_FRAMES   = 12          # ต้องนิ่งติดต่อกันกี่เฟรมจึงแคป (เดิม 18 เข้มงวดไป)
+MOTION_THRESH  = 3.0         # ค่าความต่างเฉลี่ย (0-255) ที่ถือว่านิ่ง (ยิ่งเล็กยิ่งเข้มงวด)
+SIDE_SCALE     = 0.88        # ประมาณความกว้างด้านข้างจากภาพหน้าตรง (0.85-0.9 แนะนำ)
+ALLOW_UPPER_BODY = True      # อนุญาตครึ่งตัว
+FULL_BODY_THRESH = 0.65      # ต้องเห็นเต็มตัว ~65% ของความสูงภาพ
+TORSO_FRAC     = 0.30        # สัดส่วนลำตัว ≈30% ของส่วนสูง (ใช้ตอนครึ่งตัว)
 
 # ======== MediaPipe ========
 import mediapipe as mp
@@ -22,7 +25,7 @@ mp_selfie = mp.solutions.selfie_segmentation
 BFP_BANDS = {
     "male": [
         ("Athlete/Lean (8–12%)",          8.0, 12.9),
-        ("Fit/Normal (13–19%)",          13.0, 19.9),  # ถ้าต้องการ 15–19 เป๊ะ → (15.0, 19.0)
+        ("Fit/Normal (13–19%)",          13.0, 19.9),
         ("Average/High (20–24%)",         20.0, 24.9),
         ("Overweight (25–29%)",           25.0, 29.9),
         ("Obese (≥30%)",                  30.0, 99.9),
@@ -48,7 +51,8 @@ def ramanujan_circumference(a, b):
     h = ((a-b)**2)/((a+b)**2)
     return math.pi*(a+b)*(1 + (3*h)/(10+math.sqrt(4-3*h)))
 
-def clamp_pct(v): return max(3.0, min(60.0, v))
+def clamp_pct(v): 
+    return max(3.0, min(60.0, v))
 
 def rfm_percent(height_cm, waist_circ_cm, sex):
     base = 64 if sex.lower().startswith('m') else 76
@@ -138,7 +142,7 @@ def load_gender_model(path, device):
     img_size = ckpt.get("img_size", 224)
     class_to_idx = ckpt.get("class_to_idx", {"female":0,"male":1})
     idx_to_class = {v:k for k,v in class_to_idx.items()}
-    model = models.resnet18(weights=None)
+    model = models.resnet18(weights=None)  # ใช้น้ำหนักที่เทรนเองจาก ckpt
     model.fc = nn.Linear(model.fc.in_features, len(class_to_idx))
     model.load_state_dict(ckpt["state_dict"], strict=True)
     model.eval().to(device)
@@ -158,18 +162,15 @@ def predict_gender(model, tfm, frame_bgr, device, img_size, idx_to_class):
     idx = int(np.argmax(prob))
     return idx_to_class[idx], float(prob[idx])
 
-# ======== UI Drawing (English text to avoid ??? in OpenCV) ========
+# ======== UI Drawing ========
 def draw_header_footer(img, header_text, footer_text):
     H, W = img.shape[:2]
-    # header
     cv2.rectangle(img, (0,0), (W,40), (0,0,0), -1)
     cv2.putText(img, header_text, (10,28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (80,255,80), 2, cv2.LINE_AA)
-    # footer
     cv2.rectangle(img, (0,H-36), (W,H), (0,0,0), -1)
     cv2.putText(img, footer_text, (10,H-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2, cv2.LINE_AA)
 
 def draw_guide_box(img, x0,y0,x1,y1):
-    # กรอบเขียว + มุมกลมเล็ก ๆ
     cv2.rectangle(img, (x0,y0), (x1,y1), (0,255,0), 2)
     for (cx,cy) in [(x0,y0),(x1,y0),(x0,y1),(x1,y1)]:
         cv2.circle(img, (cx,cy), 6, (0,255,0), 2)
@@ -186,7 +187,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, tfm, idx_to_class, img_size = load_gender_model(MODEL_PATH, device)
 
-    cap = cv2.VideoCapture(CAM_INDEX)
+    # ใช้ CAP_DSHOW บน Windows ช่วยลดปัญหา HighGUI/กล้อง
+    cap = cv2.VideoCapture(CAM_INDEX, cv2.CAP_DSHOW)
     if not cap.isOpened():
         print(f"เปิดกล้องไม่ได้ index={CAM_INDEX}"); sys.exit(2)
 
@@ -196,34 +198,50 @@ def main():
     still_count = 0
     captured = None
 
+    cv2.namedWindow("Live", cv2.WINDOW_NORMAL)
     with mp_pose.Pose(static_image_mode=False, enable_segmentation=False) as pose:
         while True:
             ok, frame = cap.read()
-            if not ok: break
-            H,W = frame.shape[:2]
+            if not ok:
+                print("อ่านเฟรมจากกล้องไม่สำเร็จ"); break
+
+            H, W = frame.shape[:2]
+
+            # ====== Motion / Stillness ======
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            if prev_gray is None:
+                motion_score = 999.0
+                still_count = 0
+            else:
+                diff = cv2.absdiff(gray, prev_gray)
+                motion_score = cv2.mean(diff)[0]  # 0–255 (ยิ่งน้อยยิ่งนิ่ง)
+                still_count = still_count + 1 if motion_score < MOTION_THRESH else 0
+            prev_gray = gray
+
+            # ====== Pose ======
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             res = pose.process(rgb)
 
-            # ===== วาดกรอบไกด์ (face-id style) =====
+            # กรอบไกด์
             box_h = int(H*0.9); box_w = int(W*0.5)
             x0 = (W - box_w)//2; y0 = (H - box_h)//2
             x1 = x0 + box_w;     y1 = y0 + box_h
+
             overlay = frame.copy()
+            draw_guide_box(overlay, x0, y0, x1, y1)
 
-            draw_guide_box(overlay, x0,y0,x1,y1)
-
-            # เงื่อนไข: ต้องเห็นหัว-เท้าอยู่ในกรอบ (ด้วย landmark คร่าวๆ)
-            # ===== เงื่อนไขท่าทาง / สเกลพิกเซลต่อ cm =====
             ok_pose = False
             px_per_cm = None
+            pose_mode = "-"
             lm = None
+
             if res.pose_landmarks:
                 lm = res.pose_landmarks.landmark
 
-                # ระยะหัว-เท้า (ถ้าเห็นเต็มตัว)
+                # ระยะหัว-เท้า (เต็มตัว)
                 fh_pix, head_y, foot_y = head_to_feet_pixels(lm, H)
 
-                # ช่วงหัวไหล่-สะโพก (ใช้เป็นตัวแทนเมื่อเห็นแค่ครึ่งตัว)
+                # ลำตัว (หัวไหล่ → สะโพก)
                 ls = lm[mp_pose.PoseLandmark.LEFT_SHOULDER.value]
                 rs = lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value]
                 lh = lm[mp_pose.PoseLandmark.LEFT_HIP.value]
@@ -232,34 +250,58 @@ def main():
                 hp_y = ((lh.y + rh.y)/2.0) * H
                 torso_pix = max(0.0, hp_y - sh_y)
 
-                # ให้อยู่กลางกรอบพอประมาณเหมือนเดิม
+                # ให้อยู่กลางกรอบพอประมาณ
                 midx = int(((ls.x+rs.x+lh.x+rh.x)/4.0)*W)
-                box_h = int(H*0.9); box_w = int(W*0.5)
-                x0 = (W - box_w)//2; x1 = x0 + box_w
                 within_mid = (midx > x0+int(0.1*box_w)) and (midx < x1-int(0.1*box_w))
 
-                # เกณฑ์ผ่านแบบเต็มตัว หรือแบบครึ่งตัว
                 ok_full  = (fh_pix   > H*FULL_BODY_THRESH)
-                ok_upper = (ALLOW_UPPER_BODY and torso_pix > H*0.18)   # ~18% ของความสูงภาพ
+                ok_upper = (ALLOW_UPPER_BODY and torso_pix > H*0.18)  # เกณฑ์ครึ่งตัว
 
                 if within_mid and (ok_full or ok_upper):
                     ok_pose = True
-                    # คำนวณสเกลพิกเซล→ซม.
                     if ok_full:
                         px_per_cm = fh_pix / max(1e-6, height_cm)
                         pose_mode = "full"
                     else:
-                        # ใช้สัดส่วนลำตัว ~30% ของส่วนสูงทั้งตัว
                         px_per_cm = torso_pix / max(1e-6, (TORSO_FRAC * height_cm))
                         pose_mode = "upper"
-            else:
-                pose_mode = "-"
+
+                # ดีบักโอเวอร์เลย์
+                cv2.putText(overlay,
+                            f"fh_pix={fh_pix:.1f} torso={torso_pix:.1f} "
+                            f"motion={motion_score:.2f} still={still_count} pose={pose_mode}",
+                            (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
+
+            # เงื่อนไขถ่ายอัตโนมัติ: ท่าผ่าน + นิ่งพอ
+            ok_still = (still_count >= STILL_FRAMES)
+            status = "OK" if (ok_pose and ok_still) else "WAIT"
+            draw_header_footer(
+                overlay,
+                f"Hold still inside the box… ({status})",
+                f"MOTION<{MOTION_THRESH:.1f}? {motion_score:.2f} | STILL>={STILL_FRAMES}? {still_count}"
+            )
+
+            # แสดงภาพสด
+            cv2.imshow("Live", overlay)
+            key = cv2.waitKey(1) & 0xFF
+            if key in (27, ord('q')):  # ESC/q ออก
+                break
+            if key == ord('c'):        # c = บังคับถ่าย (debug)
+                if lm is not None and px_per_cm is not None:
+                    captured = (frame.copy(), lm, px_per_cm)
+                    break
+
+            # เงื่อนไขผ่าน → จับภาพ
+            if ok_pose and ok_still and lm is not None and px_per_cm is not None:
+                captured = (frame.copy(), lm, px_per_cm)
+                break
 
     cap.release()
     cv2.destroyAllWindows()
 
     if captured is None:
-        print("❌ ไม่สามารถจับภาพนิ่งได้ ลองใหม่โดยยืนให้อยู่ในกรอบและนิ่งขึ้นอีกนิด"); sys.exit(3)
+        print("❌ ไม่สามารถจับภาพนิ่งได้ ลองใหม่โดยยืนให้อยู่ในกรอบและนิ่งขึ้นอีกนิด")
+        sys.exit(3)
 
     frame_cap, lm_cap, px_per_cm = captured
     H,W = frame_cap.shape[:2]
@@ -277,14 +319,12 @@ def main():
     hip_circ   = ramanujan_circumference(max(0.1,hip_w_cm/2.0),    max(0.1,(hip_w_cm*SIDE_SCALE)/2.0))
 
     # ------- เพศ + ตัวชี้วัด -------
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model, tfm, idx_to_class, img_size = load_gender_model(MODEL_PATH, device)
     gender, gconf = predict_gender(model, tfm, frame_cap, device, img_size, idx_to_class)
 
     bmi_val = weight_kg / ((height_cm/100.0)**2)
     bf_rfm  = rfm_percent(height_cm, max(1e-6, waist_circ), gender)
     bf_navy = navy_percent(height_cm, waist_circ, neck_circ, gender,
-                        hip_circ_cm=(hip_circ if not gender.lower().startswith('m') else None))
+                           hip_circ_cm=(hip_circ if not gender.lower().startswith('m') else None))
     bmr = bmr_katch_mcardle(weight_kg, bf_rfm)
 
     # ===== Map เป็น “แบบคนทั่วไป”
@@ -298,12 +338,13 @@ def main():
         cv2.line(disp, (0,y), (W-1,y), (0,255,0), 2)
         cv2.putText(disp, name, (10, max(20,y-6)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
 
-    # แถบหัว/ท้ายสรุปผล (อังกฤษเพื่อเลี่ยง ???)
     header = f"Gender: {gender} ({gconf*100:.1f}%)   BMI: {bmi_val:.2f}"
     footer = f"RFM: {bf_rfm:.1f}%  ≈ ~{bf_ref:.0f}%  [{bf_label}]   BMR: {bmr:.0f} kcal/day"
     draw_header_footer(disp, header, footer)
 
     cv2.imshow("Captured & Measured", disp)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
 
     # ------- สรุปผล (คอนโซล ภาษาไทย) -------
     print("\n===== ผลลัพธ์ (นิ่งแล้วแคปอัตโนมัติ) =====")
@@ -318,11 +359,7 @@ def main():
     else:
         print("Body Fat (U.S. Navy): — (ข้อมูลไม่พอ/สมมติฐานไม่ครบ)")
     print(f"BMR (Katch–McArdle): {bmr:.0f} kcal/day")
-    print(f"\nหมายเหตุ: มุมเดียวจึงประมาณด้านข้างด้วยสเกล {SIDE_SCALE:.2f}. "
-        f"เพิ่มความแม่นยำได้โดยถ่ายด้านข้างเพิ่มอีกช็อตในอนาคต\n")
-
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
+    print(f"\nหมายเหตุ: มุมเดียวจึงประมาณด้านข้างด้วยสเกล {SIDE_SCALE:.2f}. เพิ่มความแม่นยำได้โดยถ่ายด้านข้างเพิ่มอีกช็อตในอนาคต\n")
 
 if __name__ == "__main__":
     main()
